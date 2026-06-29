@@ -192,7 +192,7 @@ def join_secret_cb(call):
     user_id = call.from_user.id
     user_name = call.from_user.first_name
 
-    if chat_id search_not_in group_chats:
+    if chat_id not in group_chats:
         group_chats[chat_id] = []
 
     if len(group_chats[chat_id]) < 2:
