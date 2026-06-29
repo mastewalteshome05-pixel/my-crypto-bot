@@ -1,7 +1,12 @@
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from cryptography.fernet import Fernet
 
+# ----------------- SERVER FOR RENDER -----------------
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -14,155 +19,211 @@ def run_server():
     server.serve_forever()
 
 threading.Thread(target=run_server, daemon=True).start()
-import os
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from cryptography.fernet import Fernet
+# -----------------------------------------------------
 
 BOT_TOKEN = "8806428515:AAG5dzQnJIGw3Gp0ryeageI9bLti5hT0ceQ"
-CHANNEL_USERNAME = "mybotttt2710"  # Your channel username without '@'
+CHANNEL_USERNAME = "DarkCipherLab"
+GROUP_USERNAME = "DarkCipherLab1"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Generate or set a key for encryption
+# Temporary storage
 KEY = Fernet.generate_key()
 fernet = Fernet(KEY)
-
-# Temporary storage for user files and data
 user_data = {}
+group_chats = {} # For anonymous group chat
 
-# CRITICAL CHECK: Strict channel join function
-def check_user_joined(message):
+def check_membership(user_id):
+    """Checks if user is a member of both channel and group"""
     try:
-        member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", message.from_user.id)
-        if member.status in ['creator', 'administrator', 'member']:
-            return True
-        else:
-            raise Exception()
-    except Exception:
-        # If not joined, completely block and show only the join button
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📢 Join Channel Now", url=f"https://t.me/{CHANNEL_USERNAME}"))
-        markup.add(InlineKeyboardButton("🔄 Checked / Try Again", callback_data="check_join"))
+        channel_member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
+        group_member = bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
         
-        bot.send_message(
-            message.chat.id,
-            "⚠️ **Access Denied!**\n\nYou must join our Telegram channel first to use any feature of this bot. Please click the button below to join, then try again!",
-            reply_markup=markup
-        )
+        allowed = ['member', 'administrator', 'creator']
+        if channel_member.status in allowed and group_member.status in allowed:
+            return True
+        return False
+    except Exception:
         return False
 
-# When user sends /start
-@bot.message_handler(commands=['start'])
-def start_command(message):
-    if not check_user_joined(message): 
-        return
-    bot.reply_to(
-        message, 
-        f"Hello {message.from_user.first_name} 👋\n\n"
-        f"Welcome to **File & Text Encryption Bot** 🔐\n\n"
-        f"⚡ I can safely encrypt and decrypt your data!\n"
-        f"📝 Just send me any **Text** or 📂 **File/Photo/Video** to get started."
-    )
-
-# Handle text messages
-@bot.message_handler(func=lambda message: True)
-def handle_text(message):
-    if not check_user_joined(message): 
-        return
-    
-    user_data[message.from_user.id] = {'type': 'text', 'content': message.text}
-    
+def get_join_markup():
+    """Generates a beautiful join layout with emojis"""
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔒 Encrypt Text", callback_data="encrypt"),
-               InlineKeyboardButton("🔓 Decrypt Text", callback_data="decrypt"))
-    
-    bot.reply_to(message, "💬 **Text received! What would you like to do?**", reply_markup=markup)
+    markup.row_width = 1
+    markup.add(
+        InlineKeyboardButton("📢 Join Our Channel 📢", url=f"https://t.me/{CHANNEL_USERNAME}"),
+        InlineKeyboardButton("💬 Join Our Group 💬", url=f"https://t.me/{GROUP_USERNAME}"),
+        InlineKeyboardButton("🔄 Check Again / እረጋገጥ 🔄", callback_data="check_join")
+    )
+    return markup
 
-# Handle file, photo, and video messages
-@bot.message_handler(content_types=['document', 'photo', 'video'])
-def handle_file(message):
-    if not check_user_joined(message): 
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    if not check_membership(message.from_user.id):
+        bot.send_message(
+            message.chat.id, 
+            "⚠️ **Access Denied / መግቢያ ተከልክሏል!** ⚠️\n\n"
+            "To use this bot, you must be a member of both our channel and group.\n"
+            "ቦቱን ለመጠቀም እባክዎ መጀመሪያ ቻናላችንን እና ግሩፓችንን ይቀላቀሉ! 👇", 
+            parse_mode="Markdown", 
+            reply_markup=get_join_markup()
+        )
         return
-    
-    status_msg = bot.reply_to(message, "📥 **Processing your file... Please wait.**")
-    
-    if message.content_type == 'document':
-        file_id = message.document.file_id
-        file_name = message.document.file_name
-    elif message.content_type == 'video':
-        file_id = message.video.file_id
-        file_name = "video.mp4"
+
+    welcome_text = (
+        "🔐 **Welcome to Dark Cipher Lab Bot!** 🔐\n\n"
+        "**Commands / ትዕዛዞች:**\n"
+        "• Send any file to **Encrypt** it with a Secure Username lock.\n"
+        "• Send an encrypted file to **Decrypt** it.\n"
+        "• `/group_chat` — Use this in a group to chat secretly with someone!"
+    )
+    bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_join")
+def check_join_callback(call):
+    if check_membership(call.from_user.id):
+        bot.answer_callback_query(call.id, "✅ Success! You can now use the bot.")
+        bot.send_message(call.message.chat.id, "🎉 Welcome! Send a file to Encrypt.")
     else:
-        file_id = message.photo[-1].file_id
-        file_name = "photo.jpg"
-        
-    file_info = bot.get_file(file_id)
+        bot.answer_callback_query(call.id, "❌ You haven't joined both yet! / ገና አልገቡም!", show_alert=True)
+
+# ----------------- FILE ENCRYPTION WITH USERNAME -----------------
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    if not check_membership(message.from_user.id):
+        bot.send_message(message.chat.id, "⚠️ Join our networks first!", reply_markup=get_join_markup())
+        return
+
+    file_info = bot.get_file(message.document.file_id)
     downloaded_file = bot.download_file(file_info.file_path)
     
-    user_data[message.from_user.id] = {'type': 'file', 'data': downloaded_file, 'name': file_name}
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔒 Encrypt File", callback_data="encrypt"),
-               InlineKeyboardButton("🔓 Decrypt File", callback_data="decrypt"))
-    
-    bot.edit_message_text("📂 **File received! Choose an option below:**", message.chat.id, status_msg.message_id, reply_markup=markup)
+    # Process if it's already encrypted
+    if message.document.file_name.endswith('.enc'):
+        msg = bot.send_message(message.chat.id, "🔑 Enter the **Sender's Username** (without @) to decrypt:")
+        user_data[message.from_user.id] = {
+            'action': 'decrypt',
+            'file_data': downloaded_file,
+            'file_name': message.document.file_name,
+            'prompt_msg_id': msg.message_id
+        }
+    else:
+        # Encrypting new file
+        msg = bot.send_message(message.chat.id, "🔒 Enter the **Target User's Username** (without @) who can open this file:")
+        user_data[message.from_user.id] = {
+            'action': 'encrypt',
+            'file_data': downloaded_file,
+            'file_name': message.document.file_name,
+            'prompt_msg_id': msg.message_id
+        }
 
-# Handle button actions
-@bot.callback_query_handler(func=lambda call: True)
-def handle_buttons(call):
-    user_id = call.from_user.id
+@bot.message_handler(func=lambda message: message.from_user.id in user_data and message.chat.type == 'private')
+def handle_username_input(message):
+    target_username = message.text.strip().replace('@', '')
+    data = user_data[message.from_user.id]
     
-    if call.data == "check_join":
-        try:
-            member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
-            if member.status in ['creator', 'administrator', 'member']:
-                bot.edit_message_text("✅ **Thank you for joining! You can now send text or files.**", call.message.chat.id, call.message.message_id)
-            else:
-                bot.answer_callback_query(call.id, "❌ You still haven't joined the channel!", show_alert=True)
-        except Exception:
-            bot.answer_callback_query(call.id, "❌ Verification failed. Please join first!", show_alert=True)
-        return
+    # Auto-delete usernames for privacy
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+        bot.delete_message(message.chat.id, data['prompt_msg_id'])
+    except Exception:
+        pass
 
-    if user_id not in user_data:
-        bot.answer_callback_query(call.id, "❌ Error: No active data found. Please resend your text or file.", show_alert=True)
-        return
-    
-    item = user_data[user_id]
-    
-    if call.data == "encrypt":
-        bot.edit_message_text("🔒 **Encrypting... Please wait.**", call.message.chat.id, call.message.message_id)
-        try:
-            if item['type'] == 'text':
-                encrypted_text = fernet.encrypt(item['content'].encode()).decode()
-                bot.send_message(call.message.chat.id, f"🔒 **Encrypted Text Successfully!** 🎉\n\n`{encrypted_text}`\n\n💡 _Copy the exact text above to decrypt it later!_")
-            else:
-                enc_name = item['name'] + ".enc"
-                with open(enc_name, "wb") as f: 
-                    f.write(fernet.encrypt(item['data']))
-                with open(enc_name, "rb") as f: 
-                    bot.send_document(call.message.chat.id, f, caption="🔒 **File Encrypted Successfully!** 🎉\n\n⚠️ _Keep this file safe. Send it back here to decrypt it._")
-                os.remove(enc_name)
-            del user_data[user_id]
-        except Exception as e:
-            bot.send_message(call.message.chat.id, f"❌ Encryption failed: {e}")
+    if data['action'] == 'encrypt':
+        # Lock with both Sender and Target username
+        sender_username = message.from_user.username or "unknown"
+        clean_sender = sender_username.replace('@', '')
+        
+        encrypted_data = fernet.encrypt(data['file_data'])
+        # Append meta info safely
+        meta_block = f"\n__META__:{clean_sender}:{target_username}".encode()
+        final_data = encrypted_data + meta_block
+
+        enc_file_name = data['file_name'] + ".enc"
+        with open(enc_file_name, "wb") as f:
+            f.write(final_data)
             
-    elif call.data == "decrypt":
-        bot.edit_message_text("🔓 **Decrypting... Please wait.**", call.message.chat.id, call.message.message_id)
+        with open(enc_file_name, "rb") as f:
+            bot.send_document(message.chat.id, f, caption=f"🔒 Encrypted for @{target_username}")
+        os.remove(enc_file_name)
+        
+    elif data['action'] == 'decrypt':
         try:
-            if item['type'] == 'text':
-                decrypted_text = fernet.decrypt(item['content'].encode()).decode()
-                bot.send_message(call.message.chat.id, f"🔓 **Decrypted Text Successfully!** 🎉\n\n{decrypted_text}")
+            file_content = data['file_data']
+            if b"__META__:" in file_content:
+                main_data, meta = file_content.split(b"__META__:")
+                allowed_sender, allowed_target = meta.decode().split(':')
+                
+                current_user = message.from_user.username or "unknown"
+                clean_current = current_user.replace('@', '')
+                
+                # Validation
+                if target_username.lower() == allowed_sender.lower() and clean_current.lower() == allowed_target.lower():
+                    decrypted_data = fernet.decrypt(main_data)
+                    dec_file_name = data['file_name'].replace('.enc', '')
+                    
+                    with open(dec_file_name, "wb") as f:
+                        f.write(decrypted_data)
+                    with open(dec_file_name, "rb") as f:
+                        bot.send_document(message.chat.id, f, caption="✅ Decrypted Successfully!")
+                    os.remove(dec_file_name)
+                else:
+                    bot.send_message(message.chat.id, "❌ Invalid Username! You are not authorized to decrypt this file.")
             else:
-                dec_name = "decrypted_" + item['name'].replace(".enc", "")
-                with open(dec_name, "wb") as f: 
-                    f.write(fernet.decrypt(item['data']))
-                with open(dec_name, "rb") as f: 
-                    bot.send_document(call.message.chat.id, f, caption="🔓 **File Decrypted Successfully!** 🎉")
-                os.remove(dec_name)
-            del user_data[user_id]
+                bot.send_message(message.chat.id, "❌ This file layout is standard or corrupted.")
         except Exception:
-            bot.send_message(call.message.chat.id, "❌ **Decryption Failed!**\n\nThis data is either corrupted or was not encrypted by this bot.")
+            bot.send_message(message.chat.id, "❌ Decryption Failed. Check credentials.")
 
-print("🔐 Advanced Emojified Bot is running perfectly...")
-bot.infinity_polling()
+    del user_data[message.from_user.id]
+
+# ----------------- ANONYMOUS GROUP CRYPTO CHAT -----------------
+@bot.message_handler(commands=['group_chat'])
+def setup_group_chat(message):
+    if message.chat.type == 'private':
+        bot.send_message(message.chat.id, "ℹ️ Use this command inside the group @DarkCipherLab1!")
+        return
+        
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔗 Connect Secretly 🔗", callback_data="join_secret_chat"))
+    bot.send_message(message.chat.id, "💬 **Secure Chat Session**\nClick below to bond a private channel inside this group.", reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "join_secret_chat")
+def join_secret_cb(call):
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    user_name = call.from_user.first_name
+
+    if chat_id search_not_in group_chats:
+        group_chats[chat_id] = []
+
+    if len(group_chats[chat_id]) < 2:
+        if user_id not in [u['id'] for u in group_chats[chat_id]]:
+            group_chats[chat_id].append({'id': user_id, 'name': user_name})
+            bot.send_message(chat_id, f"👤 {user_name} joined the secret session.")
+            
+        if len(group_chats[chat_id]) == 2:
+            bot.send_message(chat_id, "🔒 **Session Established!** Both users can now type in group, texts will be auto-encrypted for others.")
+    else:
+        bot.answer_callback_query(call.id, "❌ A session is already full here.", show_alert=True)
+
+@bot.message_handler(func=lambda message: message.chat.type != 'private')
+def handle_group_messages(message):
+    chat_id = message.chat.id
+    if chat_id in group_chats and len(group_chats[chat_id]) == 2:
+        session_users = [u['id'] for u in group_chats[chat_id]]
+        if message.from_user.id in session_users:
+            sender_name = message.from_user.first_name
+            raw_text = message.text
+            
+            # Encrypt message
+            enc_text = fernet.encrypt(raw_text.encode()).decode()
+            
+            # Delete original instantly
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+                
+            # Post encrypted version to group safely
+            bot.send_message(chat_id, f"👤 **{sender_name}** (Secure):\n`{enc_text}`", parse_mode="Markdown")
+
+bot.polling(none_stop=True)
