@@ -1,4 +1,20 @@
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class DummyServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), DummyServer)
+    server.serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
+import os
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from cryptography.fernet import Fernet
