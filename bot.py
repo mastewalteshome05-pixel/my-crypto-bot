@@ -1,11 +1,27 @@
 import os
+import io
+import base64
+import logging
+import secrets
 import threading
 import time
-import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from cryptography.fernet import Fernet
+
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler,
+)
 
 # ----------------- SERVER FOR RENDER (DO NOT TOUCH) -----------------
 class DummyServer(BaseHTTPRequestHandler):
@@ -22,344 +38,329 @@ def run_server():
 threading.Thread(target=run_server, daemon=True).start()
 # ---------------------------------------------------------------------
 
-# 🔐 የቦት፣ የቻናል እና የግሩፕ መለያዎች
+# ---------- CONFIG ----------
 BOT_TOKEN = "8806428515:AAG5dzQnJIGw3Gp0ryeageI9bLti5hT0ceQ"
 CHANNEL_USERNAME = "DarkCipherLab"
 GROUP_USERNAME = "DarkCipherLab1"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+MAX_FILE_SIZE = 20 * 1024 * 1024  # Telegram bot API limit ~20MB for download
+PBKDF2_ITERATIONS = 200_000
+SALT_LEN = 16
+NONCE_LEN = 12
 
-# ዳታቤዝ ፋይሎች
-LANG_DB = "user_languages.json"
-KEYS_DB = "user_keys.json"
+# Conversation states
+WAITING_FILE, WAITING_PASSWORD = range(2)
 
-def load_json(filename):
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-def save_json(filename, data):
+
+# ---------- CRYPTO HELPERS ----------
+def derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=PBKDF2_ITERATIONS,
+    )
+    return kdf.derive(password.encode("utf-8"))
+
+
+def encrypt_bytes(data: bytes, password: str) -> bytes:
+    salt = secrets.token_bytes(SALT_LEN)
+    nonce = secrets.token_bytes(NONCE_LEN)
+    key = derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, data, None)
+    return salt + nonce + ciphertext
+
+
+def decrypt_bytes(blob: bytes, password: str) -> bytes:
+    if len(blob) < SALT_LEN + NONCE_LEN:
+        raise ValueError("File is corrupted or not encrypted.")
+    salt = blob[:SALT_LEN]
+    nonce = blob[SALT_LEN:SALT_LEN + NONCE_LEN]
+    ciphertext = blob[SALT_LEN + NONCE_LEN:]
+    key = derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """ተጠቃሚው ቻናሉን እና ግሩፑን ጆይን ማድረጉን ያረጋግጣል"""
     try:
-        with open(filename, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
-
-def get_user_cipher(user_id):
-    """ለእያንዳንዱ ሰው የተለየ የኢንክሪፕሽን ቁልፍ በመስጠት ሀኪንግን ይከላከላል"""
-    keys = load_json(KEYS_DB)
-    uid_str = str(user_id)
-    if uid_str not in keys:
-        new_key = Fernet.generate_key().decode()
-        keys[uid_str] = new_key
-        save_json(KEYS_DB, keys)
-    return Fernet(keys[uid_str].encode())
-
-# ጊዜያዊ ዳታዎች
-user_data = {}
-group_chats = {}
-
-def check_membership(user_id):
-    try:
-        channel_member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
+        channel_member = await context.bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
         if channel_member.status not in ['member', 'administrator', 'creator']:
             return False
-        group_member = bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
+            
+        group_member = await context.bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
         if group_member.status not in ['member', 'administrator', 'creator']:
             return False
+            
         return True
     except Exception:
         return False
 
-def get_language_markup():
-    markup = InlineKeyboardMarkup()
-    markup.row_width = 2
-    markup.add(
-        InlineKeyboardButton("🇪🇹 አማርኛ", callback_data="lang_am"),
-        InlineKeyboardButton("🇺🇸 English", callback_data="lang_en")
-    )
-    return markup
 
-def get_join_markup(lang):
-    markup = InlineKeyboardMarkup()
-    markup.row_width = 1
-    if lang == 'am':
-        markup.add(
-            InlineKeyboardButton("📢 ቻናላችንን ይቀላቀሉ (Join Channel) 📢", url=f"https://t.me/{CHANNEL_USERNAME}"),
-            InlineKeyboardButton("💬 ግሩፓችንን ይቀላቀሉ (Join Group) 💬", url=f"https://t.me/{GROUP_USERNAME}"),
-            InlineKeyboardButton("🔄 እረጋገጥ / Check Again 🔄", callback_data="check_join")
-        )
-    else:
-        markup.add(
-            InlineKeyboardButton("📢 Join Our Channel 📢", url=f"https://t.me/{CHANNEL_USERNAME}"),
-            InlineKeyboardButton("💬 Join Our Group 💬", url=f"https://t.me/{GROUP_USERNAME}"),
-            InlineKeyboardButton("🔄 Check Again / Try Again 🔄", callback_data="check_join")
-        )
-    return markup
+def get_join_markup():
+    markup = [
+        [InlineKeyboardButton("📢 Join Our Channel 📢", url=f"https://t.me/{CHANNEL_USERNAME}")],
+        [InlineKeyboardButton("💬 Join Our Group 💬", url=f"https://t.me/{GROUP_USERNAME}")],
+        [InlineKeyboardButton("🔄 Check Access 🔄", callback_data="check_join_access")]
+    ]
+    return InlineKeyboardMarkup(markup)
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    try:
-        bot.send_message(
-            message.chat.id,
-            "👋 **Welcome! Please choose your language / እባክዎ ቋንቋ ይምረጡ፦**",
+
+# ---------- BOT HANDLERS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if not await check_membership(user_id, context):
+        await update.message.reply_text(
+            "⚠️ **Access Denied!**\n\nTo use this bot, you must join both our channel and group first! 👇",
             parse_mode="Markdown",
-            reply_markup=get_language_markup()
+            reply_markup=get_join_markup()
         )
-    except Exception:
-        pass
+        return
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("lang_"))
-def set_language(call):
-    try:
-        user_id = call.from_user.id
-        lang = "am" if call.data == "lang_am" else "en"
-        
-        langs = load_json(LANG_DB)
-        langs[str(user_id)] = lang
-        save_json(LANG_DB, langs)
-        
-        if not check_membership(user_id):
-            txt = "⚠️ **መግቢያ ተከልክሏል!**\n\nቦቱን ለመጠቀም መጀመሪያ ቻናላችንን እና ግሩፓችንን ይቀላቀሉ!" if lang == 'am' else "⚠️ **Access Denied!**\n\nTo use this bot, you must join both our channel and group first!"
-            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=txt, parse_mode="Markdown", reply_markup=get_join_markup(lang))
-        else:
-            send_main_menu(call.message.chat.id, user_id)
-    except Exception:
-        pass
+    keyboard = [
+        [InlineKeyboardButton("🔒 Encrypt", callback_data="mode_encrypt")],
+        [InlineKeyboardButton("🔓 Decrypt", callback_data="mode_decrypt")],
+    ]
+    await update.message.reply_text(
+        "👋 Welcome to **Dark Cipher Lab Bot**!\n\n"
+        "This bot protects your Text, Photos, Videos, and Documents using advanced AES-256 password-based encryption.\n\n"
+        "Please choose an option below:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "check_join")
-def check_join_callback(call):
-    try:
-        user_id = call.from_user.id
-        langs = load_json(LANG_DB)
-        lang = langs.get(str(user_id), 'am')
-        
-        if check_membership(user_id):
-            alert_txt = "✅ ተሳክቷል! ቦቱን መጠቀም ይችላሉ።" if lang == 'am' else "✅ Success! You can now use the bot."
-            bot.answer_callback_query(call.id, alert_txt)
-            send_main_menu(call.message.chat.id, user_id)
-        else:
-            alert_err = "❌ ይቅርታ፣ ገና ሁለቱንም አልገቡም!" if lang == 'am' else "❌ You haven't joined both yet!"
-            bot.answer_callback_query(call.id, alert_err, show_alert=True)
-    except Exception:
-        pass
 
-def send_main_menu(chat_id, user_id):
-    langs = load_json(LANG_DB)
-    lang = langs.get(str(user_id), 'am')
-    if lang == 'am':
-        welcome_text = (
-            "🔐 **እንኳን ወደ Dark Cipher Lab Bot በሰላም መጡ!** 🔐\n\n"
-            "🎈 **መመሪያ፦**\n"
-            "1️⃣ **ጽሑፍ ለመቆለፍ፦** ዝም ብለው የሚፈልጉትን ጽሑፍ በቻቱ ላይ ይጻፉ።\n"
-            "2️⃣ **ፋይል ለመቆለፍ፦** የትኛውንም ፋይል (ፎቶ፣ ቪዲዮ) ይላኩ።\n"
-            "3️⃣ **ለመክፈት፦** የተቆለፈ ኮድ ወይም ፋይል ሲልኩለት ቦቱ ይፈታዋል፤ **ለከፍተኛ ደህንነት መልእክቱ በጥቂት ሰከንዶች ውስጥ ራሱ ይጠፋል!**\n\n"
-            "👉 `/group_chat` — በግሩፕ ውስጥ ሁለት ሰዎች ብቻ በሚስጥር ለማውራት!"
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if await check_membership(user_id, context):
+        keyboard = [
+            [InlineKeyboardButton("🔒 Encrypt", callback_data="mode_encrypt")],
+            [InlineKeyboardButton("🔓 Decrypt", callback_data="mode_decrypt")],
+        ]
+        await query.edit_message_text(
+            "✅ Access Granted! Welcome to **Dark Cipher Lab Bot**.\n\nPlease choose an option below:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
-        welcome_text = (
-            "🔐 **Welcome to Dark Cipher Lab Bot!** 🔐\n\n"
-            "🎈 **Instructions:**\n"
-            "1️⃣ **Encrypt Text:** Just send any normal text message to the bot.\n"
-            "2️⃣ **Encrypt File:** Send any file (photo, video, document) to the bot.\n"
-            "3️⃣ **Decrypt:** Send an encrypted text back. **Decrypted messages will self-destruct for maximum security!**\n\n"
-            "👉 `/group_chat` — Inside groups, use this to chat secretly!"
+        await query.answer("❌ Access Denied! You haven't joined both yet.", show_alert=True)
+
+
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not await check_membership(user_id, context):
+        await query.edit_message_text("⚠️ Access Denied! Please /start again.", reply_markup=get_join_markup())
+        return ConversationHandler.END
+
+    mode = "encrypt" if query.data == "mode_encrypt" else "decrypt"
+    context.user_data["mode"] = mode
+
+    label = "🔒 Encrypt" if mode == "encrypt" else "🔓 Decrypt"
+    await query.edit_message_text(
+        f"{label} mode selected.\n\n📎 Now, send the Text or File you want to process."
+    )
+    return WAITING_FILE
+
+
+async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user_id = msg.from_user.id
+    
+    if not await check_membership(user_id, context):
+        await msg.reply_text("⚠️ Access Denied!", reply_markup=get_join_markup())
+        return ConversationHandler.END
+
+    mode = context.user_data.get("mode", "encrypt")
+
+    if msg.text and not msg.document and not msg.photo and not msg.video and not msg.audio and not msg.voice:
+        context.user_data["content_type"] = "text"
+        context.user_data["text_content"] = msg.text
+        await msg.reply_text(
+            f"📝 Text received.\n\n🔑 Now, send a **Password** to protect it.\n"
+            f"⚠️ Make sure to remember it, or you won't be able to recover it!"
         )
-    bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
+        return WAITING_PASSWORD
 
-def delayed_delete(chat_id, message_id, delay=10):
-    def target():
-        time.sleep(delay)
-        try: bot.delete_message(chat_id, message_id)
-        except Exception: pass
-    threading.Thread(target=target, daemon=True).start()
+    file_obj = None
+    file_name = None
 
-# ----------------- MAIN ENCRYPTION HANDLER -----------------
-@bot.message_handler(content_types=['text', 'document', 'photo', 'video'])
-def handle_all_inputs(message):
+    if msg.document:
+        file_obj = msg.document
+        file_name = msg.document.file_name or "file"
+    elif msg.photo:
+        file_obj = msg.photo[-1]
+        file_name = "photo.jpg"
+    elif msg.video:
+        file_obj = msg.video
+        file_name = msg.video.file_name or "video.mp4"
+    elif msg.audio:
+        file_obj = msg.audio
+        file_name = msg.audio.file_name or "audio.mp3"
+    elif msg.voice:
+        file_obj = msg.voice
+        file_name = "voice.ogg"
+    else:
+        await msg.reply_text("⚠️ Please send text or a valid file.")
+        return WAITING_FILE
+
+    if getattr(file_obj, "file_size", None) and file_obj.file_size > MAX_FILE_SIZE:
+        await msg.reply_text(f"⚠️ File is too large (Max {MAX_FILE_SIZE // (1024*1024)}MB).")
+        return WAITING_FILE
+
+    context.user_data["content_type"] = "file"
+    context.user_data["file_id"] = file_obj.file_id
+    context.user_data["file_name"] = file_name
+
+    action = "encrypt" if mode == "encrypt" else "decrypt"
+    await msg.reply_text(
+        f"📄 File received: `{file_name}`\n\n🔑 Now, send the **Password** to {action}.",
+        parse_mode="Markdown",
+    )
+    return WAITING_PASSWORD
+
+
+async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+
     try:
-        if message.chat.type != 'private':
-            handle_group_messages(message)
-            return
-
-        user_id = message.from_user.id
-        langs = load_json(LANG_DB)
-        lang = langs.get(str(user_id), 'am')
-
-        if not check_membership(user_id):
-            bot.send_message(message.chat.id, "⚠️ Access Denied!", reply_markup=get_join_markup(lang))
-            return
-
-        cipher = get_user_cipher(user_id)
-
-        # 1. ጽሑፍ ከመጣ
-        if message.content_type == 'text':
-            text = message.text
-            if text.startswith('/'): return
-                
-            if text.startswith("የተቆለፈ መልእክት [") or text.startswith("🔒 Cipher:"):
-                try:
-                    clean_text = text.replace("የተቆለፈ መልእክት [", "").replace("]", "").replace("🔒 Cipher: ", "")
-                    decrypted = cipher.decrypt(clean_text.encode()).decode()
-                    
-                    msg_out = f"✅ **የተፈታ ሚስጥር (Decrypted):**\n\n`{decrypted}`\n\n⚠️ *ይህ መልእክት ከ10 ሰከንድ በኋላ በራስ-ሰር ይጠፋል!*" if lang == 'am' else f"✅ **Decrypted Text:**\n\n`{decrypted}`\n\n⚠️ *This message will self-destruct in 10 seconds!*"
-                    sent_msg = bot.send_message(message.chat.id, msg_out, parse_mode="Markdown")
-                    
-                    delayed_delete(message.chat.id, sent_msg.message_id, 10)
-                    try: bot.delete_message(message.chat.id, message.message_id)
-                    except Exception: pass
-                except Exception:
-                    msg_err = "❌ ስህተት! ይህ ኮድ በሌላ አካውንት የተቆለፈ ነው ወይም ተስተካክሏል።" if lang == 'am' else "❌ Error! This code belongs to another user or is invalid."
-                    bot.send_message(message.chat.id, msg_err)
-            else:
-                encrypted = cipher.encrypt(text.encode()).decode()
-                response = f"🔒 **የተቆለፈ መልእክት [**`{encrypted}`**]**" if lang == 'am' else f"🔒 **🔒 Cipher: {encrypted}**"
-                bot.send_message(message.chat.id, response, parse_mode="Markdown")
-
-        # 2. ፋይል ከመጣ
-        else:
-            file_id = None
-            file_name = "secret_file"
-            if message.content_type == 'document':
-                file_id = message.document.file_id
-                file_name = message.document.file_name
-            elif message.content_type == 'photo':
-                file_id = message.photo[-1].file_id
-                file_name = "photo.jpg"
-            elif message.content_type == 'video':
-                file_id = message.video.file_id
-                file_name = "video.mp4"
-                
-            file_info = bot.get_file(file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-            
-            if file_name.endswith('.enc'):
-                prompt_txt = "🔑 ፋይሉን ለመክፈት **የላኪውን Username** ያስገቡ፦" if lang == 'am' else "🔑 Enter the **Sender's Username** to decrypt:"
-                msg = bot.send_message(message.chat.id, prompt_txt)
-                user_data[user_id] = {'action': 'decrypt', 'file_data': downloaded_file, 'file_name': file_name, 'prompt_id': msg.message_id}
-            else:
-                prompt_txt = "🔒 ይህ ፋይል እንዲከፍት የፈለጉትን ሰው **Username** ያስገቡ፦" if lang == 'am' else "🔒 Enter the **Target User's Username**:"
-                msg = bot.send_message(message.chat.id, prompt_txt)
-                user_data[user_id] = {'action': 'encrypt', 'file_data': downloaded_file, 'file_name': file_name, 'prompt_id': msg.message_id}
+        await update.message.delete()
     except Exception:
         pass
 
-@bot.message_handler(func=lambda message: message.from_user.id in user_data and message.chat.type == 'private')
-def handle_username_lock(message):
-    try:
-        user_id = message.from_user.id
-        langs = load_json(LANG_DB)
-        lang = langs.get(str(user_id), 'am')
-        target_username = message.text.strip().replace('@', '')
-        data = user_data[user_id]
-        cipher = get_user_cipher(user_id)
-        
+    if len(password) < 4:
+        await update.effective_chat.send_message("⚠️ Password too short (Min 4 characters). Try again.")
+        return WAITING_PASSWORD
+
+    mode = context.user_data.get("mode", "encrypt")
+    content_type = context.user_data.get("content_type", "file")
+
+    status_msg = await update.effective_chat.send_message("⏳ Processing, please wait…")
+
+    if content_type == "text":
+        text_content = context.user_data.get("text_content", "")
         try:
-            bot.delete_message(message.chat.id, message.message_id)
-            bot.delete_message(message.chat.id, data['prompt_id'])
-        except Exception: pass
+            if mode == "encrypt":
+                raw = text_content.encode("utf-8")
+                encrypted = encrypt_bytes(raw, password)
+                token = base64.urlsafe_b64encode(encrypted).decode("ascii")
+                await status_msg.edit_text(
+                    "✅ Encryption Successful! Copy this cipher text:\n\n"
+                    f"`🔒 Cipher: {token}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                try:
+                    clean_text = text_content.replace("🔒 Cipher: ", "").strip()
+                    encrypted = base64.urlsafe_b64decode(clean_text.encode("ascii"))
+                except Exception:
+                    await status_msg.edit_text("❌ Error: Invalid cipher text format.")
+                    context.user_data.clear()
+                    return ConversationHandler.END
 
-        if data['action'] == 'encrypt':
-            sender = message.from_user.username or "unknown"
-            clean_sender = sender.replace('@', '')
-            
-            encrypted_bytes = cipher.encrypt(data['file_data'])
-            meta_block = f"\n__META__:{clean_sender}:{target_username}".encode()
-            final_data = encrypted_bytes + meta_block
+                try:
+                    raw = decrypt_bytes(encrypted, password)
+                    await status_msg.edit_text("✅ Decryption Successful!\n\n" + raw.decode("utf-8", errors="replace"))
+                except InvalidTag:
+                    await status_msg.edit_text("❌ Decryption Failed! Wrong password or corrupted text.")
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error occurred: {e}")
 
-            out_name = data['file_name'] + ".enc"
-            with open(out_name, "wb") as f: f.write(final_data)
-            with open(out_name, "rb") as f:
-                cap = f"🔒 ፋይሉ በምስጢር ተቆልፏል! መክፈት የሚችለው፦ @{target_username}" if lang == 'am' else f"🔒 Encrypted! Only @{target_username} can open this."
-                bot.send_document(message.chat.id, f, caption=cap)
-            os.remove(out_name)
-            
-        elif data['action'] == 'decrypt':
-            try:
-                file_content = data['file_data']
-                if b"__META__:" in file_content:
-                    main_data, meta = file_content.split(b"__META__:")
-                    allowed_sender, allowed_target = meta.decode().split(':')
-                    current_user = message.from_user.username or "unknown"
-                    clean_current = current_user.replace('@', '')
-                    
-                    if target_username.lower() == allowed_sender.lower() and clean_current.lower() == allowed_target.lower():
-                        decrypted_bytes = cipher.decrypt(main_data)
-                        out_name = data['file_name'].replace('.enc', '')
-                        with open(out_name, "wb") as f: f.write(decrypted_bytes)
-                        with open(out_name, "rb") as f:
-                            cap = "✅ ተከፍቷል! (ከ15 ሰከንድ በኋላ ይጠፋል)" if lang == 'am' else "✅ Decrypted! (Deletes in 15s)"
-                            sent_doc = bot.send_document(message.chat.id, f, caption=cap)
-                            delayed_delete(message.chat.id, sent_doc.message_id, 15)
-                        os.remove(out_name)
-                    else:
-                        msg_err = "❌ አልተፈቀደልዎትም! መረጃው የተጠበቀ ነው።" if lang == 'am' else "❌ Access Denied!"
-                        bot.send_message(message.chat.id, msg_err)
-                else:
-                    bot.send_message(message.chat.id, "❌ Invalid file structure.")
-            except Exception:
-                bot.send_message(message.chat.id, "❌ Decryption Failed.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
-        del user_data[user_id]
-    except Exception:
-        pass
+    file_id = context.user_data.get("file_id")
+    file_name = context.user_data.get("file_name")
 
-# ----------------- በግሩፕ ውስጥ በምስጢር ማውሪያ -----------------
-@bot.message_handler(commands=['group_chat'])
-def setup_group_chat(message):
     try:
-        if message.chat.type == 'private':
-            bot.send_message(message.chat.id, f"ℹ️ Use this in our group: @{GROUP_USERNAME}")
-            return
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔗 በሚስጥር ተገናኝ (Connect) 🔗", callback_data="join_secret_chat"))
-        bot.send_message(message.chat.id, "💬 **የግሩፕ ሚስጥራዊ ማውሪያ መስመር / Group Secret Session**", reply_markup=markup, parse_mode="Markdown")
-    except Exception:
-        pass
+        tg_file = await context.bot.get_file(file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        file_bytes = bytes(file_bytes)
 
-@bot.callback_query_handler(func=lambda call: call.data == "join_secret_chat")
-def join_secret_cb(call):
-    try:
-        chat_id = call.message.chat.id
-        user_id = call.from_user.id
-        user_name = call.from_user.first_name
-
-        if chat_id not in group_chats: group_chats[chat_id] = []
-
-        if len(group_chats[chat_id]) < 2:
-            if user_id not in [u['id'] for u in group_chats[chat_id]]:
-                group_chats[chat_id].append({'id': user_id, 'name': user_name})
-                bot.send_message(chat_id, f"👤 {user_name} joined the secret session.")
-                
-            if len(group_chats[chat_id]) == 2:
-                bot.send_message(chat_id, "🔒 **Session Locked!** መልእክቶች በሙሉ በራስ-ሰር ይጠፋሉ።")
+        if mode == "encrypt":
+            result = encrypt_bytes(file_bytes, password)
+            out_name = file_name + ".enc"
+            caption = f"✅ Encryption Successful!\n📄 `{out_name}`\n\n⚠️ Keep your password safe!"
         else:
-            bot.answer_callback_query(call.id, "❌ Session is full.", show_alert=True)
-    except Exception:
-        pass
+            try:
+                result = decrypt_bytes(file_bytes, password)
+            except InvalidTag:
+                await status_msg.edit_text("❌ Decryption Failed! Wrong password or invalid file.")
+                context.user_data.clear()
+                return ConversationHandler.END
 
-def handle_group_messages(message):
-    try:
-        chat_id = message.chat.id
-        if chat_id in group_chats and len(group_chats[chat_id]) == 2:
-            session_users = [u['id'] for u in group_chats[chat_id]]
-            if message.from_user.id in session_users:
-                sender_name = message.from_user.first_name
-                raw_text = message.text
-                if not raw_text or raw_text.startswith('/'): return
-                
-                cipher = get_user_cipher(message.from_user.id)
-                enc_text = cipher.encrypt(raw_text.encode()).decode()
-                try: bot.delete_message(chat_id, message.message_id)
-                except Exception: pass
-                
-                sec_msg = bot.send_message(chat_id, f"👤 **{sender_name}** (Secure):\n`🔒 Cipher: {enc_text}`", parse_mode="Markdown")
-                delayed_delete(chat_id, sec_msg.message_id, 8)
-    except Exception:
-        pass
+            out_name = file_name[:-4] if file_name.endswith(".enc") else "decrypted_" + file_name
+            caption = f"✅ Decryption Successful!\n📄 `{out_name}`"
 
-bot.polling(none_stop=True)
+        out_buffer = io.BytesIO(result)
+        out_buffer.name = out_name
+
+        await status_msg.delete()
+        await update.effective_chat.send_document(document=out_buffer, caption=caption)
+
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled. Send /start to begin again.")
+    return ConversationHandler.END
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔐 **Commands:**\n\n"
+        "/start — Start the bot\n"
+        "/cancel — Cancel the current operation\n"
+        "/help — Show this message",
+        parse_mode="Markdown",
+    )
+
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(mode_callback, pattern="^mode_")],
+        states={
+            WAITING_FILE: [
+                MessageHandler(
+                    (filters.Document.ALL | filters.PHOTO | filters.VIDEO |
+                     filters.AUDIO | filters.VOICE | (filters.TEXT & ~filters.COMMAND)),
+                    receive_content,
+                )
+            ],
+            WAITING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join_access$"))
+    app.add_handler(conv_handler)
+
+    print("🤖 Bot is running securely...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
