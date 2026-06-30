@@ -1,2 +1,2 @@
-pyTelegramBotAPI
-cryptography
+python-telegram-bot==20.8
+cryptography==42.0.5
