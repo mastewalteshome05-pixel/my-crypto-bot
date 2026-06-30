@@ -22,59 +22,60 @@ def run_server():
 threading.Thread(target=run_server, daemon=True).start()
 # ---------------------------------------------------------------------
 
-# 🔐 ትክክለኛ የቦት፣ የቻናል እና የግሩፕ መለያዎች
+# 🔐 የቦት፣ የቻናል እና የግሩፕ መለያዎች
 BOT_TOKEN = "8806428515:AAG5dzQnJIGw3Gp0ryeageI9bLti5hT0ceQ"
 CHANNEL_USERNAME = "DarkCipherLab"
 GROUP_USERNAME = "DarkCipherLab1"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ዋና ሚስጥራዊ ቁልፍ ማመንጫ
-KEY = Fernet.generate_key()
-fernet = Fernet(KEY)
+# ዳታቤዝ ፋይሎች
+LANG_DB = "user_languages.json"
+KEYS_DB = "user_keys.json"
 
-# ቋሚ የቋንቋ ማከማቻ ፋይል
-DB_FILE = "user_languages.json"
-
-def load_languages():
-    if os.path.exists(DB_FILE):
+def load_json(filename):
+    if os.path.exists(filename):
         try:
-            with open(DB_FILE, "r") as f:
+            with open(filename, "r") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def save_language(user_id, lang):
+def save_json(filename, data):
     try:
-        langs = load_languages()
-        langs[str(user_id)] = lang
-        with open(DB_FILE, "w") as f:
-            json.dump(langs, f)
+        with open(filename, "w") as f:
+            json.dump(data, f)
     except Exception:
         pass
 
-# ጊዜያዊ መረጃ ማስቀመጫዎች
-user_data = {}    # ለፋይል ኢንክሪፕሽን
-group_chats = {}  # ለግሩፕ ሚስጥራዊ ቻት
+def get_user_cipher(user_id):
+    """ለእያንዳንዱ ሰው የተለየ የኢንክሪፕሽን ቁልፍ በመስጠት ሀኪንግን ይከላከላል"""
+    keys = load_json(KEYS_DB)
+    uid_str = str(user_id)
+    if uid_str not in keys:
+        new_key = Fernet.generate_key().decode()
+        keys[uid_str] = new_key
+        save_json(KEYS_DB, keys)
+    return Fernet(keys[uid_str].encode())
+
+# ጊዜያዊ ዳታዎች
+user_data = {}
+group_chats = {}
 
 def check_membership(user_id):
-    """ተጠቃሚው ቻናሉን እና ግሩፑን ጆይን ማድረጉን በደህንነት ያረጋግጣል"""
     try:
         channel_member = bot.get_chat_member(f"@{CHANNEL_USERNAME}", user_id)
         if channel_member.status not in ['member', 'administrator', 'creator']:
             return False
-            
         group_member = bot.get_chat_member(f"@{GROUP_USERNAME}", user_id)
         if group_member.status not in ['member', 'administrator', 'creator']:
             return False
-            
         return True
     except Exception:
         return False
 
 def get_language_markup():
-    """የቋንቋ መምረጫ አዝራሮች"""
     markup = InlineKeyboardMarkup()
     markup.row_width = 2
     markup.add(
@@ -84,7 +85,6 @@ def get_language_markup():
     return markup
 
 def get_join_markup(lang):
-    """የግዴታ ጆይን ማድረጊያ በተኖች እና Check ማድረጊያ"""
     markup = InlineKeyboardMarkup()
     markup.row_width = 1
     if lang == 'am':
@@ -119,25 +119,13 @@ def set_language(call):
         user_id = call.from_user.id
         lang = "am" if call.data == "lang_am" else "en"
         
-        save_language(user_id, lang)
+        langs = load_json(LANG_DB)
+        langs[str(user_id)] = lang
+        save_json(LANG_DB, langs)
         
         if not check_membership(user_id):
-            if lang == 'am':
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="⚠️ **መግቢያ ተከልክሏል!** ⚠️\n\nቦቱን ለመጠቀም እባክዎ መጀመሪያ ቻናላችንን እና ግሩፓችንን ይቀላቀሉ! 👇",
-                    parse_mode="Markdown",
-                    reply_markup=get_join_markup('am')
-                )
-            else:
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="⚠️ **Access Denied!** ⚠️\n\nTo use this bot, you must join both our channel and group first! 👇",
-                    parse_mode="Markdown",
-                    reply_markup=get_join_markup('en')
-                )
+            txt = "⚠️ **መግቢያ ተከልክሏል!**\n\nቦቱን ለመጠቀም መጀመሪያ ቻናላችንን እና ግሩፓችንን ይቀላቀሉ!" if lang == 'am' else "⚠️ **Access Denied!**\n\nTo use this bot, you must join both our channel and group first!"
+            bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=txt, parse_mode="Markdown", reply_markup=get_join_markup(lang))
         else:
             send_main_menu(call.message.chat.id, user_id)
     except Exception:
@@ -147,54 +135,47 @@ def set_language(call):
 def check_join_callback(call):
     try:
         user_id = call.from_user.id
-        langs = load_languages()
+        langs = load_json(LANG_DB)
         lang = langs.get(str(user_id), 'am')
         
         if check_membership(user_id):
-            if lang == 'am':
-                bot.answer_callback_query(call.id, "✅ ተሳክቷል! ቦቱን መጠቀም ይችላሉ።")
-            else:
-                bot.answer_callback_query(call.id, "✅ Success! You can now use the bot.")
+            alert_txt = "✅ ተሳክቷል! ቦቱን መጠቀም ይችላሉ።" if lang == 'am' else "✅ Success! You can now use the bot."
+            bot.answer_callback_query(call.id, alert_txt)
             send_main_menu(call.message.chat.id, user_id)
         else:
-            if lang == 'am':
-                bot.answer_callback_query(call.id, "❌ ይቅርታ፣ ገና ሁለቱንም አልገቡም! እባክዎ ጆይን ያድርጉ።", show_alert=True)
-            else:
-                bot.answer_callback_query(call.id, "❌ You haven't joined both yet! Please try again.", show_alert=True)
+            alert_err = "❌ ይቅርታ፣ ገና ሁለቱንም አልገቡም!" if lang == 'am' else "❌ You haven't joined both yet!"
+            bot.answer_callback_query(call.id, alert_err, show_alert=True)
     except Exception:
         pass
 
 def send_main_menu(chat_id, user_id):
-    langs = load_languages()
+    langs = load_json(LANG_DB)
     lang = langs.get(str(user_id), 'am')
     if lang == 'am':
         welcome_text = (
             "🔐 **እንኳን ወደ Dark Cipher Lab Bot በሰላም መጡ!** 🔐\n\n"
-            "🎈 **መመሪያ / እንዴት እንደሚሰራ፦**\n"
-            "1️⃣ **ጽሑፍ ለመቆለፍ (Encrypt)፦** ዝም ብለው የሚፈልጉትን ጽሑፍ በቻቱ ላይ ይጻፉ።\n"
-            "2️⃣ **ፋይል ለመቆለፍ (File Encrypt)፦** የትኛውንም ፋይል (ፎቶ፣ ቪዲዮ) ይላኩ።\n"
-            "3️⃣ **የተቆለፈ ለመክፈት (Decrypt)፦** የተቆለፈ ኮድ ሲልኩለት ቦቱ ይፈታዋል፤ **ከደህንነት አንጻር መልእክቱ ከ10 ሰከንድ በኋላ ራሱ ይጠፋል!**\n\n"
-            "👉 `/group_chat` — በግሩፕ ውስጥ ሁለት ሰዎች በከፍተኛ ጥበቃ በሚስጥር ለማውራት!"
+            "🎈 **መመሪያ፦**\n"
+            "1️⃣ **ጽሑፍ ለመቆለፍ፦** ዝም ብለው የሚፈልጉትን ጽሑፍ በቻቱ ላይ ይጻፉ።\n"
+            "2️⃣ **ፋይል ለመቆለፍ፦** የትኛውንም ፋይል (ፎቶ፣ ቪዲዮ) ይላኩ።\n"
+            "3️⃣ **ለመክፈት፦** የተቆለፈ ኮድ ወይም ፋይል ሲልኩለት ቦቱ ይፈታዋል፤ **ለከፍተኛ ደህንነት መልእክቱ በጥቂት ሰከንዶች ውስጥ ራሱ ይጠፋል!**\n\n"
+            "👉 `/group_chat` — በግሩፕ ውስጥ ሁለት ሰዎች ብቻ በሚስጥር ለማውራት!"
         )
     else:
         welcome_text = (
             "🔐 **Welcome to Dark Cipher Lab Bot!** 🔐\n\n"
-            "🎈 **Instructions / How to use:**\n"
+            "🎈 **Instructions:**\n"
             "1️⃣ **Encrypt Text:** Just send any normal text message to the bot.\n"
             "2️⃣ **Encrypt File:** Send any file (photo, video, document) to the bot.\n"
-            "3️⃣ **Decrypt:** Send an encrypted text back. **For maximum security, decrypted texts will self-destruct in 10 seconds!**\n\n"
-            "👉 `/group_chat` — Inside groups, use this to chat secretly with advanced security!"
+            "3️⃣ **Decrypt:** Send an encrypted text back. **Decrypted messages will self-destruct for maximum security!**\n\n"
+            "👉 `/group_chat` — Inside groups, use this to chat secretly!"
         )
     bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
 
 def delayed_delete(chat_id, message_id, delay=10):
-    """መልእክቱ ከተነበበ በኋላ ለሀከር እንዳይጋለጥ በራስ-ሰር ያጠፋዋል"""
     def target():
         time.sleep(delay)
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
+        try: bot.delete_message(chat_id, message_id)
+        except Exception: pass
     threading.Thread(target=target, daemon=True).start()
 
 # ----------------- MAIN ENCRYPTION HANDLER -----------------
@@ -206,12 +187,14 @@ def handle_all_inputs(message):
             return
 
         user_id = message.from_user.id
-        langs = load_languages()
+        langs = load_json(LANG_DB)
         lang = langs.get(str(user_id), 'am')
 
         if not check_membership(user_id):
             bot.send_message(message.chat.id, "⚠️ Access Denied!", reply_markup=get_join_markup(lang))
             return
+
+        cipher = get_user_cipher(user_id)
 
         # 1. ጽሑፍ ከመጣ
         if message.content_type == 'text':
@@ -221,32 +204,26 @@ def handle_all_inputs(message):
             if text.startswith("የተቆለፈ መልእክት [") or text.startswith("🔒 Cipher:"):
                 try:
                     clean_text = text.replace("የተቆለፈ መልእክት [", "").replace("]", "").replace("🔒 Cipher: ", "")
-                    decrypted = fernet.decrypt(clean_text.encode()).decode()
+                    decrypted = cipher.decrypt(clean_text.encode()).decode()
                     
-                    msg_out = f"✅ **የተፈታ ሚስጥር (Decrypted):**\n\n`{decrypted}`\n\n⚠️ *ይህ መልእክት ከ10 ሰከንድ በኋላ ከቻቱ ላይ በራስ-ሰር ይጠፋል!*" if lang == 'am' else f"✅ **Decrypted Text:**\n\n`{decrypted}`\n\n⚠️ *This message will self-destruct in 10 seconds for security!*"
+                    msg_out = f"✅ **የተፈታ ሚስጥር (Decrypted):**\n\n`{decrypted}`\n\n⚠️ *ይህ መልእክት ከ10 ሰከንድ በኋላ በራስ-ሰር ይጠፋል!*" if lang == 'am' else f"✅ **Decrypted Text:**\n\n`{decrypted}`\n\n⚠️ *This message will self-destruct in 10 seconds!*"
                     sent_msg = bot.send_message(message.chat.id, msg_out, parse_mode="Markdown")
                     
-                    # 🔐 የሀኪንግ መከላከያ ቁልፍ ዘዴ (የተፈታውን መልእክት እና የላከውን ማጥፋት)
                     delayed_delete(message.chat.id, sent_msg.message_id, 10)
                     try: bot.delete_message(message.chat.id, message.message_id)
                     except Exception: pass
-                    
                 except Exception:
-                    msg_err = "❌ ስህተት! ይህ ኮድ አልተፈቀደም ወይም ተስተካክሏል።" if lang == 'am' else "❌ Error! Code is invalid or modified."
+                    msg_err = "❌ ስህተት! ይህ ኮድ በሌላ አካውንት የተቆለፈ ነው ወይም ተስተካክሏል።" if lang == 'am' else "❌ Error! This code belongs to another user or is invalid."
                     bot.send_message(message.chat.id, msg_err)
             else:
-                encrypted = fernet.encrypt(text.encode()).decode()
-                if lang == 'am':
-                    response = f"🔒 **የተቆለፈ መልእክት [**`{encrypted}`**]**\n\n👆 ይህንን ኮድ ለሚፈልጉት ሰው መላክ ይችላሉ። ተቀባዩ ለዚህ ቦት ሲልከው ይፈታለታል።"
-                else:
-                    response = f"🔒 **🔒 Cipher: {encrypted}**\n\n👆 Copy this encrypted message and send it to your friend. They can send it back to this bot to decrypt it."
+                encrypted = cipher.encrypt(text.encode()).decode()
+                response = f"🔒 **የተቆለፈ መልእክት [**`{encrypted}`**]**" if lang == 'am' else f"🔒 **🔒 Cipher: {encrypted}**"
                 bot.send_message(message.chat.id, response, parse_mode="Markdown")
 
         # 2. ፋይል ከመጣ
         else:
             file_id = None
             file_name = "secret_file"
-            
             if message.content_type == 'document':
                 file_id = message.document.file_id
                 file_name = message.document.file_name
@@ -261,11 +238,11 @@ def handle_all_inputs(message):
             downloaded_file = bot.download_file(file_info.file_path)
             
             if file_name.endswith('.enc'):
-                prompt_txt = "🔑 ፋይሉን ለመክፈት **የላኪውን Username** ያለምንም @ ያስገቡ፦" if lang == 'am' else "🔑 Enter the **Sender's Username** (without @) to decrypt:"
+                prompt_txt = "🔑 ፋይሉን ለመክፈት **የላኪውን Username** ያስገቡ፦" if lang == 'am' else "🔑 Enter the **Sender's Username** to decrypt:"
                 msg = bot.send_message(message.chat.id, prompt_txt)
                 user_data[user_id] = {'action': 'decrypt', 'file_data': downloaded_file, 'file_name': file_name, 'prompt_id': msg.message_id}
             else:
-                prompt_txt = "🔒 ይህ ፋይል እንዲከፍት የፈለጉትን ሰው **Username** ያለምንም @ ያስገቡ፦" if lang == 'am' else "🔒 Enter the **Target User's Username** (without @) who can open this:"
+                prompt_txt = "🔒 ይህ ፋይል እንዲከፍት የፈለጉትን ሰው **Username** ያስገቡ፦" if lang == 'am' else "🔒 Enter the **Target User's Username**:"
                 msg = bot.send_message(message.chat.id, prompt_txt)
                 user_data[user_id] = {'action': 'encrypt', 'file_data': downloaded_file, 'file_name': file_name, 'prompt_id': msg.message_id}
     except Exception:
@@ -275,10 +252,11 @@ def handle_all_inputs(message):
 def handle_username_lock(message):
     try:
         user_id = message.from_user.id
-        langs = load_languages()
+        langs = load_json(LANG_DB)
         lang = langs.get(str(user_id), 'am')
         target_username = message.text.strip().replace('@', '')
         data = user_data[user_id]
+        cipher = get_user_cipher(user_id)
         
         try:
             bot.delete_message(message.chat.id, message.message_id)
@@ -289,7 +267,7 @@ def handle_username_lock(message):
             sender = message.from_user.username or "unknown"
             clean_sender = sender.replace('@', '')
             
-            encrypted_bytes = fernet.encrypt(data['file_data'])
+            encrypted_bytes = cipher.encrypt(data['file_data'])
             meta_block = f"\n__META__:{clean_sender}:{target_username}".encode()
             final_data = encrypted_bytes + meta_block
 
@@ -310,20 +288,19 @@ def handle_username_lock(message):
                     clean_current = current_user.replace('@', '')
                     
                     if target_username.lower() == allowed_sender.lower() and clean_current.lower() == allowed_target.lower():
-                        decrypted_bytes = fernet.decrypt(main_data)
+                        decrypted_bytes = cipher.decrypt(main_data)
                         out_name = data['file_name'].replace('.enc', '')
                         with open(out_name, "wb") as f: f.write(decrypted_bytes)
                         with open(out_name, "rb") as f:
-                            cap = "✅ ፋይሉ በተሳካ ሁኔታ ተከፍቷል! (ከ20 ሰከንድ በኋላ ይጠፋል)" if lang == 'am' else "✅ Decrypted! (Will delete in 20s)"
+                            cap = "✅ ተከፍቷል! (ከ15 ሰከንድ በኋላ ይጠፋል)" if lang == 'am' else "✅ Decrypted! (Deletes in 15s)"
                             sent_doc = bot.send_document(message.chat.id, f, caption=cap)
-                            # 🔐 ፋይሉ ከተከፈተ በኋላ ለደህንነት ሲባል ይጠፋል
-                            delayed_delete(message.chat.id, sent_doc.message_id, 20)
+                            delayed_delete(message.chat.id, sent_doc.message_id, 15)
                         os.remove(out_name)
                     else:
-                        msg_err = "❌ አልተፈቀደልዎትም! Username ስህተት ነው!" if lang == 'am' else "❌ Access Denied! Invalid credentials."
+                        msg_err = "❌ አልተፈቀደልዎትም! መረጃው የተጠበቀ ነው።" if lang == 'am' else "❌ Access Denied!"
                         bot.send_message(message.chat.id, msg_err)
                 else:
-                    bot.send_message(message.chat.id, "❌ Unsupported layout.")
+                    bot.send_message(message.chat.id, "❌ Invalid file structure.")
             except Exception:
                 bot.send_message(message.chat.id, "❌ Decryption Failed.")
 
@@ -331,14 +308,13 @@ def handle_username_lock(message):
     except Exception:
         pass
 
-# ----------------- በግሩፕ ውስጥ በምስጢር ማውሪያ (ADVANCED SECURITY) -----------------
+# ----------------- በግሩፕ ውስጥ በምስጢር ማውሪያ -----------------
 @bot.message_handler(commands=['group_chat'])
 def setup_group_chat(message):
     try:
         if message.chat.type == 'private':
             bot.send_message(message.chat.id, f"ℹ️ Use this in our group: @{GROUP_USERNAME}")
             return
-            
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🔗 በሚስጥር ተገናኝ (Connect) 🔗", callback_data="join_secret_chat"))
         bot.send_message(message.chat.id, "💬 **የግሩፕ ሚስጥራዊ ማውሪያ መስመር / Group Secret Session**", reply_markup=markup, parse_mode="Markdown")
@@ -361,8 +337,8 @@ def join_secret_cb(call):
                 
             if len(group_chats[chat_id]) == 2:
                 bot.send_message(chat_id, "🔒 **Session Locked!** መልእክቶች በሙሉ በራስ-ሰር ይጠፋሉ።")
-    else:
-        bot.answer_callback_query(call.id, "❌ Session is full.", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ Session is full.", show_alert=True)
     except Exception:
         pass
 
@@ -376,11 +352,11 @@ def handle_group_messages(message):
                 raw_text = message.text
                 if not raw_text or raw_text.startswith('/'): return
                 
-                enc_text = fernet.encrypt(raw_text.encode()).decode()
+                cipher = get_user_cipher(message.from_user.id)
+                enc_text = cipher.encrypt(raw_text.encode()).decode()
                 try: bot.delete_message(chat_id, message.message_id)
                 except Exception: pass
                 
-                # መልእክቱ በግሩፕ ውስጥ ለሌሎች እንዳይታይ ኢንክሪፕት ሆኖ ይላካል፣ ከ8 ሰከንድ በኋላ ደግሞ ሙሉ በሙሉ ይጠፋል!
                 sec_msg = bot.send_message(chat_id, f"👤 **{sender_name}** (Secure):\n`🔒 Cipher: {enc_text}`", parse_mode="Markdown")
                 delayed_delete(chat_id, sec_msg.message_id, 8)
     except Exception:
