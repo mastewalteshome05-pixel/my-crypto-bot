@@ -39,7 +39,7 @@ threading.Thread(target=run_server, daemon=True).start()
 # ---------------------------------------------------------------------
 
 # ---------- CONFIG ----------
-BOT_TOKEN = "8806428515:AAG5dzQnJIGw3Gp0ryeageI9bLti5hT0ceQ"
+BOT_TOKEN = "8806428515:AAHBCgPKhfxrinBExVTaL-SbMVCXr2jJYzg"
 CHANNEL_USERNAME = "DarkCipherLab"
 GROUP_USERNAME = "DarkCipherLab1"
 
